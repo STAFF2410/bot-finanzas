@@ -79,6 +79,7 @@ async function setup(options = {}) {
   const env = {
     TELEGRAM_BOT_TOKEN: 'fake-test-only', GEMINI_API_KEY: 'fake-test-only',
     SUPABASE_URL: 'https://example.invalid', SUPABASE_KEY: 'fake-test-only',
+    ALLOWED_TELEGRAM_USER_ID: '123456789',
     ...options.env,
   };
   vm.runInNewContext(source, {
@@ -95,15 +96,50 @@ async function setup(options = {}) {
   }, { filename: 'index.js' });
   // Allow the initial asynchronous accounts load to finish.
   await new Promise(resolve => setImmediate(resolve));
-  state.text = text => state.handlers.text({ chat: { id: 10 }, text });
-  state.voice = () => state.handlers.voice({
-    chat: { id: 10 }, voice: { file_id: 'simulated-file' },
+  state.text = (text, overrides = {}) => state.handlers.text({
+    chat: { id: 10, type: 'private' }, from: { id: 123456789 }, text, ...overrides,
+  });
+  state.voice = (overrides = {}) => state.handlers.voice({
+    chat: { id: 10, type: 'private' }, from: { id: 123456789 },
+    voice: { file_id: 'simulated-file' }, ...overrides,
   });
   return state;
 }
 
 test('rechaza el inicio si falta una clave requerida', async () => {
   await assert.rejects(setup({ env: { TELEGRAM_BOT_TOKEN: undefined } }), /exit:1/);
+});
+
+test('rechaza un ID autorizado que no sea numérico', async () => {
+  await assert.rejects(
+    setup({ env: { ALLOWED_TELEGRAM_USER_ID: 'not-an-id' } }),
+    /exit:1/,
+  );
+});
+
+test('rechaza mensajes privados de otras personas antes de Gemini o Supabase', async () => {
+  const s = await setup();
+  await s.text('/saldos', { from: { id: 999999999 } });
+  assert.equal(s.prompts.length, 0);
+  assert.equal(s.inserts.length, 0);
+  assert.match(s.messages[0].text, /bot es privado/);
+});
+
+test('rechaza grupos aunque escriba el usuario autorizado', async () => {
+  const s = await setup();
+  await s.text('/saldos', { chat: { id: -10, type: 'group' } });
+  assert.equal(s.prompts.length, 0);
+  assert.equal(s.inserts.length, 0);
+  assert.match(s.messages[0].text, /bot es privado/);
+});
+
+test('rechaza notas de voz de otras personas sin descargarlas ni procesarlas', async () => {
+  const s = await setup();
+  await s.voice({ from: { id: 999999999 } });
+  assert.equal(s.downloads.length, 0);
+  assert.equal(s.prompts.length, 0);
+  assert.equal(s.inserts.length, 0);
+  assert.match(s.messages[0].text, /bot es privado/);
 });
 
 test('registra un gasto y responde al mismo chat', async () => {

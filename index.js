@@ -7,12 +7,22 @@ const { GoogleGenerativeAI } = require('@google/generative-ai');
 const { createClient } = require('@supabase/supabase-js');
 
 // Validar variables de entorno requeridas
-const requiredEnv = ['TELEGRAM_BOT_TOKEN', 'GEMINI_API_KEY', 'SUPABASE_URL', 'SUPABASE_KEY'];
+const requiredEnv = [
+    'TELEGRAM_BOT_TOKEN',
+    'GEMINI_API_KEY',
+    'SUPABASE_URL',
+    'SUPABASE_KEY',
+    'ALLOWED_TELEGRAM_USER_ID',
+];
 for (const envVar of requiredEnv) {
     if (!process.env[envVar]) {
         console.error(`❌ Error: La variable de entorno ${envVar} no está configurada.`);
         process.exit(1);
     }
+}
+if (!/^\d+$/.test(process.env.ALLOWED_TELEGRAM_USER_ID.trim())) {
+    console.error('❌ Error: ALLOWED_TELEGRAM_USER_ID debe ser el ID numérico de Telegram.');
+    process.exit(1);
 }
 
 // 1. INICIALIZACIÓN DE CLIENTES
@@ -25,6 +35,15 @@ const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
 const app = express();
 const PORT = process.env.PORT || 3000;
 app.use(express.json());
+
+function usuarioAutorizado(msg) {
+  return msg.chat?.type === 'private'
+    && String(msg.from?.id || '') === process.env.ALLOWED_TELEGRAM_USER_ID.trim();
+}
+
+async function rechazarAccesoNoAutorizado(chatId) {
+  await bot.sendMessage(chatId, '⛔ Este bot es privado y no tienes acceso autorizado.');
+}
 
 app.get('/', (req, res) => {
   res.send('🤖 Bot Financiero activo y escuchando eventos.');
@@ -216,6 +235,10 @@ async function procesarEntradaFinanciera(chatId, promptParts, rawTextPreview) {
 // 7. LISTENER: MENSAJES DE TEXTO
 bot.on('text', async (msg) => {
   const chatId = msg.chat.id;
+  if (!usuarioAutorizado(msg)) {
+    await rechazarAccesoNoAutorizado(chatId);
+    return;
+  }
   const texto = msg.text.trim();
 
   // Comando especial para consultar saldos
@@ -242,6 +265,10 @@ bot.on('text', async (msg) => {
 // 8. LISTENER: NOTAS DE VOZ (Audio nativo multimodal en Gemini)
 bot.on('voice', async (msg) => {
   const chatId = msg.chat.id;
+  if (!usuarioAutorizado(msg)) {
+    await rechazarAccesoNoAutorizado(chatId);
+    return;
+  }
 
   try {
     await bot.sendChatAction(chatId, 'record_voice');
