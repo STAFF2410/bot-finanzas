@@ -16,7 +16,7 @@ const operation = (overrides = {}) => ({
 
 async function setup(options = {}) {
   const state = { handlers: {}, messages: [], actions: [], inserts: [],
-    prompts: [], downloads: [], logs: [], listening: false };
+    prompts: [], downloads: [], logs: [], listening: false, model: null };
   const analysis = options.analysis ?? {
     estado: 'completo', operaciones: [operation()], mensaje_usuario: 'Registrado',
   };
@@ -75,7 +75,8 @@ async function setup(options = {}) {
       return database;
     } },
     '@google/generative-ai': { GoogleGenerativeAI: class {
-      getGenerativeModel() {
+      getGenerativeModel(config) {
+        state.model = config.model;
         return { async generateContent(parts) {
           state.prompts.push(parts);
           if (options.geminiError) throw new Error('Gemini no disponible');
@@ -220,10 +221,27 @@ test('consulta saldos sin llamar a Gemini ni guardar datos', async () => {
 test('previsualiza el análisis de Gemini sin guardar operaciones', async () => {
   const s = await setup();
   await s.text('/previsualizar Gasté 12 USD de Zinli en almuerzo');
+  assert.equal(s.model, 'gemini-3.5-flash');
   assert.equal(s.prompts.length, 1);
   assert.equal(s.inserts.length, 0);
   assert.match(s.messages[0].text, /no se guardó en Supabase/i);
   assert.match(s.messages[0].text, /Alimentación/);
+});
+
+test('responde a /start con instrucciones sin llamar a Gemini ni guardar', async () => {
+  const s = await setup();
+  await s.text('/start');
+  assert.equal(s.prompts.length, 0);
+  assert.equal(s.inserts.length, 0);
+  assert.match(s.messages[0].text, /\/previsualizar/);
+});
+
+test('responde a /start con el nombre del bot', async () => {
+  const s = await setup();
+  await s.text('/start@FinanzasBot');
+  assert.equal(s.prompts.length, 0);
+  assert.equal(s.inserts.length, 0);
+  assert.match(s.messages[0].text, /Bot financiero conectado/);
 });
 
 test('admite la sintaxis de comando con nombre de bot sin guardar', async () => {
