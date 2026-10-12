@@ -5,7 +5,7 @@ servicios originales.
 
 ## Pruebas
 
-Ejecutar `npm test` (Node.js 20). Las 20 pruebas simulan Telegram, Gemini y
+Ejecutar `npm test` (Node.js 20). Las 29 pruebas simulan Telegram, Gemini y
 Supabase; no requieren claves, red ni datos reales. Cubren mensajes, audio,
 saldos, guardado, errores y rechazo de otros usuarios y grupos.
 
@@ -32,5 +32,11 @@ compatibles con las consultas de `index.js`. El proyecto incluye `ws` como
 transporte de Realtime para Supabase en Node.js 20; el bot no habilita ni utiliza
 suscripciones Realtime.
 
-El bot usa el modelo estable `gemini-3.5-flash` para texto y audio. `/start`
-muestra los comandos disponibles.
+El bot usa `gemini-3.8-flash` y cambia a `gemini-3.6-flash` si hay saturación.
+En ambos intenta una vez más con espera exponencial para fallos transitorios.
+Si los dos están indisponibles, avisa y no guarda el movimiento. `/start` muestra
+los comandos disponibles.
+
+Google AI Pro da cuota mayor dentro de AI Studio; las llamadas de esta aplicación
+con una clave de Gemini API se gestionan por separado, y la suscripción no evita
+sobrecargas temporales del servicio.

@@ -16,7 +16,9 @@ const operation = (overrides = {}) => ({
 
 async function setup(options = {}) {
   const state = { handlers: {}, messages: [], actions: [], inserts: [],
-    prompts: [], downloads: [], logs: [], listening: false, model: null };
+    prompts: [], downloads: [], logs: [], listening: false,
+    modelsCreated: [], geminiCalls: [], shutdownHandlers: {} };
+  const remainingGeminiFailures = { ...(options.geminiFailures || {}) };
   const analysis = options.analysis ?? {
     estado: 'completo', operaciones: [operation()], mensaje_usuario: 'Registrado',
   };
@@ -56,7 +58,12 @@ async function setup(options = {}) {
     },
   };
   const expressApp = {
-    use() {}, get() {}, listen() { state.listening = true; },
+    use() {},
+    get() {},
+    listen() {
+      state.listening = true;
+      return { close() { state.listening = false; } };
+    },
   };
   const express = () => expressApp;
   express.json = () => () => {};
@@ -76,10 +83,15 @@ async function setup(options = {}) {
     } },
     '@google/generative-ai': { GoogleGenerativeAI: class {
       getGenerativeModel(config) {
-        state.model = config.model;
+        state.modelsCreated.push(config.model);
         return { async generateContent(parts) {
+          state.geminiCalls.push(config.model);
           state.prompts.push(parts);
-          if (options.geminiError) throw new Error('Gemini no disponible');
+          if (options.geminiError) throw new Error('503 Service Unavailable: high demand');
+          if (remainingGeminiFailures[config.model] > 0) {
+            remainingGeminiFailures[config.model] -= 1;
+            throw new Error('503 Service Unavailable: high demand');
+          }
           return { response: { text: () => options.rawResponse ?? JSON.stringify(analysis) } };
         } };
       }
@@ -97,10 +109,16 @@ async function setup(options = {}) {
       if (name === 'node-telegram-bot-api') return { Bot: modules[name] };
       return modules[name];
     },
-    process: { env, exit(code) { throw new Error(`exit:${code}`); } },
+    process: {
+      env,
+      exit(code) { throw new Error(`exit:${code}`); },
+      once(signal, handler) { state.shutdownHandlers[signal] = handler; },
+    },
+    setTimeout(callback) { callback(); return 0; },
     console: {
       log(...args) { state.logs.push(args); },
       error(...args) { state.logs.push(args); },
+      warn(...args) { state.logs.push(args); },
     },
     Buffer,
   }, { filename: 'index.js' });
@@ -221,7 +239,8 @@ test('consulta saldos sin llamar a Gemini ni guardar datos', async () => {
 test('previsualiza el análisis de Gemini sin guardar operaciones', async () => {
   const s = await setup();
   await s.text('/previsualizar Gasté 12 USD de Zinli en almuerzo');
-  assert.equal(s.model, 'gemini-3.5-flash');
+  assert.deepEqual(s.geminiCalls, ['gemini-3.8-flash']);
+  assert.ok(s.modelsCreated.includes('gemini-3.6-flash'));
   assert.equal(s.prompts.length, 1);
   assert.equal(s.inserts.length, 0);
   assert.match(s.messages[0].text, /no se guardó en Supabase/i);
@@ -259,8 +278,48 @@ test('pide un texto para la vista previa sin llamar a Gemini', async () => {
   assert.match(s.messages[0].text, /Uso: \/previsualizar/);
 });
 
+test('reintenta una vez los 503 antes de responder desde el modelo principal', async () => {
+  const s = await setup({
+    geminiFailures: { 'gemini-3.8-flash': 1 },
+  });
+  await s.text('/previsualizar Gasté 12 USD de Zinli en almuerzo');
+  assert.deepEqual(s.geminiCalls, ['gemini-3.8-flash', 'gemini-3.8-flash']);
+  assert.equal(s.inserts.length, 0);
+  assert.match(s.messages[0].text, /no se guardó en Supabase/);
+});
+
+test('cambia al modelo alternativo si persiste la saturación y solo guarda una vez', async () => {
+  const s = await setup({
+    geminiFailures: { 'gemini-3.8-flash': 2 },
+  });
+  await s.text('Gasté 12 USD de Zinli en almuerzo');
+  assert.deepEqual(s.geminiCalls, [
+    'gemini-3.8-flash', 'gemini-3.8-flash', 'gemini-3.6-flash',
+  ]);
+  assert.equal(s.inserts.length, 1);
+});
+
+test('si ambos modelos siguen saturados, da un aviso claro y no registra operaciones', async () => {
+  const s = await setup({ geminiError: true });
+  await s.text('Gasté 12 USD de Zinli en almuerzo');
+  assert.deepEqual(s.geminiCalls, [
+    'gemini-3.8-flash', 'gemini-3.8-flash',
+    'gemini-3.6-flash', 'gemini-3.6-flash',
+  ]);
+  assert.equal(s.inserts.length, 0);
+  assert.match(s.messages[0].text, /temporalmente saturado/);
+  assert.match(s.messages[0].text, /No se guardó ningún movimiento/);
+});
+
+test('cierra el health server cuando termina el workflow', async () => {
+  const s = await setup();
+  assert.equal(s.listening, true);
+  s.shutdownHandlers.SIGTERM();
+  assert.equal(s.listening, false);
+});
+
 for (const [name, options, expected] of [
-  ['fallo de Gemini', { geminiError: true }, /Gemini no disponible/],
+  ['fallo de Gemini', { geminiError: true }, /temporalmente saturado/],
   ['JSON inválido', { rawResponse: 'no es JSON' }, /Error Contable\/Servidor/],
   ['fallo al guardar', { insertError: true }, /Inserción rechazada/],
   ['fallo al cargar cuentas', { accountsError: true }, /no existe en la base de datos/],
