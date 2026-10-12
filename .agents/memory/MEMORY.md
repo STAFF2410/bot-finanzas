@@ -1,0 +1,1 @@
+- [Telegram and Supabase runtime compatibility](telegram-runtime-compatibility.md) — keep Telegram SDK 2.x and inject `ws` into Supabase under Node.js 20.

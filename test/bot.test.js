@@ -21,14 +21,17 @@ async function setup(options = {}) {
     estado: 'completo', operaciones: [operation()], mensaje_usuario: 'Registrado',
   };
   const bot = {
-    on(event, handler) { state.handlers[event] = handler; },
-    async sendMessage(chatId, text, formatting) {
-      state.messages.push({ chatId, text, formatting });
-    },
-    async sendChatAction(chatId, action) { state.actions.push(action); },
-    async getFileLink() {
-      if (options.voiceError) throw new Error('Audio no disponible');
-      return 'https://example.invalid/test-audio';
+    on(event, handler) { state.handlers[event] = handler; return this; },
+    catch(handler) { state.errorHandler = handler; return this; },
+    api: {
+      async sendMessage({ chat_id: chatId, text, ...formatting }) {
+        state.messages.push({ chatId, text, formatting });
+      },
+      async sendChatAction({ action }) { state.actions.push(action); },
+      async getFile() {
+        if (options.voiceError) throw new Error('Audio no disponible');
+        return { file_path: 'voice/file.ogg' };
+      },
     },
   };
   const database = {
@@ -64,8 +67,13 @@ async function setup(options = {}) {
       state.downloads.push(url);
       return { data: Buffer.from('simulated audio') };
     } },
+    ws: function TestWebSocket() {},
     'node-telegram-bot-api': function () { return bot; },
-    '@supabase/supabase-js': { createClient() { return database; } },
+    'node-telegram-bot-api/node': { run() { state.polling = true; return Promise.resolve(); } },
+    '@supabase/supabase-js': { createClient(url, key, options) {
+      assert.equal(options.realtime.transport, modules.ws);
+      return database;
+    } },
     '@google/generative-ai': { GoogleGenerativeAI: class {
       getGenerativeModel() {
         return { async generateContent(parts) {
@@ -85,6 +93,7 @@ async function setup(options = {}) {
   vm.runInNewContext(source, {
     require(name) {
       assert.ok(Object.hasOwn(modules, name), `Unexpected dependency: ${name}`);
+      if (name === 'node-telegram-bot-api') return { Bot: modules[name] };
       return modules[name];
     },
     process: { env, exit(code) { throw new Error(`exit:${code}`); } },
@@ -96,13 +105,13 @@ async function setup(options = {}) {
   }, { filename: 'index.js' });
   // Allow the initial asynchronous accounts load to finish.
   await new Promise(resolve => setImmediate(resolve));
-  state.text = (text, overrides = {}) => state.handlers.text({
+  state.text = (text, overrides = {}) => state.handlers.message({ message: {
     chat: { id: 10, type: 'private' }, from: { id: 123456789 }, text, ...overrides,
-  });
-  state.voice = (overrides = {}) => state.handlers.voice({
+  } });
+  state.voice = (overrides = {}) => state.handlers.message({ message: {
     chat: { id: 10, type: 'private' }, from: { id: 123456789 },
     voice: { file_id: 'simulated-file' }, ...overrides,
-  });
+  } });
   return state;
 }
 
@@ -206,6 +215,30 @@ test('consulta saldos sin llamar a Gemini ni guardar datos', async () => {
   assert.equal(s.prompts.length, 0);
   assert.equal(s.inserts.length, 0);
   assert.match(s.messages[0].text, /100 USD/);
+});
+
+test('previsualiza el análisis de Gemini sin guardar operaciones', async () => {
+  const s = await setup();
+  await s.text('/previsualizar Gasté 12 USD de Zinli en almuerzo');
+  assert.equal(s.prompts.length, 1);
+  assert.equal(s.inserts.length, 0);
+  assert.match(s.messages[0].text, /no se guardó en Supabase/i);
+  assert.match(s.messages[0].text, /Alimentación/);
+});
+
+test('admite la sintaxis de comando con nombre de bot sin guardar', async () => {
+  const s = await setup();
+  await s.text('/previsualizar@FinanzasBot Gasté 12 USD de Zinli en almuerzo');
+  assert.equal(s.prompts.length, 1);
+  assert.equal(s.inserts.length, 0);
+});
+
+test('pide un texto para la vista previa sin llamar a Gemini', async () => {
+  const s = await setup();
+  await s.text('/previsualizar');
+  assert.equal(s.prompts.length, 0);
+  assert.equal(s.inserts.length, 0);
+  assert.match(s.messages[0].text, /Uso: \/previsualizar/);
 });
 
 for (const [name, options, expected] of [
