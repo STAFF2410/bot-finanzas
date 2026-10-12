@@ -31,3 +31,6 @@ Supabase debe tener `cuentas`, `transacciones` y `vista_saldos_actuales`
 compatibles con las consultas de `index.js`. El proyecto incluye `ws` como
 transporte de Realtime para Supabase en Node.js 20; el bot no habilita ni utiliza
 suscripciones Realtime.
+
+El bot usa el modelo estable `gemini-3.5-flash` para texto y audio. `/start`
+muestra los comandos disponibles.

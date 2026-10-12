@@ -124,7 +124,7 @@ ESTRUCTURA JSON OBLIGATORIA:
 
 // Modelo de Gemini configurado para devolver JSON directamente
 const geminiModel = genAI.getGenerativeModel({
-  model: 'gemini-1.5-flash',
+  model: 'gemini-3.5-flash',
   generationConfig: {
     responseMimeType: 'application/json',
     temperature: 0.1,
@@ -251,6 +251,17 @@ async function procesarMensajeTexto(msg) {
     return;
   }
   const texto = msg.text.trim();
+
+  if (/^\/(?:start|help)(?:@\w+)?(?:\s.*)?$/i.test(texto)) {
+    await sendMessage(
+      chatId,
+      '🤖 Bot financiero conectado.\n\n'
+      + '• /saldos — consulta saldos (solo lectura).\n'
+      + '• /previsualizar <texto> — prueba Gemini sin guardar nada.\n'
+      + '• Envía un movimiento normal solo cuando quieras registrarlo permanentemente.'
+    );
+    return;
+  }
 
   // Vista previa segura para probar Gemini sin crear registros en Supabase.
   if (texto.startsWith('/previsualizar')) {
