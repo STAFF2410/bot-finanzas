@@ -1,8 +1,9 @@
 require('dotenv').config();
 const express = require('express');
 const axios = require('axios');
-const TelegramBotPackage = require('node-telegram-bot-api');
-const TelegramBot = TelegramBotPackage.default || TelegramBotPackage;
+const WebSocket = require('ws');
+const { Bot: TelegramBot } = require('node-telegram-bot-api');
+const { run: runTelegramBot } = require('node-telegram-bot-api/node');
 const { GoogleGenerativeAI } = require('@google/generative-ai');
 const { createClient } = require('@supabase/supabase-js');
 
@@ -27,9 +28,25 @@ if (!/^\d+$/.test(process.env.ALLOWED_TELEGRAM_USER_ID.trim())) {
 
 // 1. INICIALIZACIÓN DE CLIENTES
 console.log("Cargando constructor de Telegram...");
-const bot = new TelegramBot(process.env.TELEGRAM_BOT_TOKEN, { polling: true });
-const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY);
+const bot = new TelegramBot(process.env.TELEGRAM_BOT_TOKEN);
+const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY, {
+  realtime: { transport: WebSocket },
+});
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
+
+function sendMessage(chatId, text, options) {
+  return bot.api.sendMessage({ chat_id: chatId, text, ...options });
+}
+
+function sendChatAction(chatId, action) {
+  return bot.api.sendChatAction({ chat_id: chatId, action });
+}
+
+async function getFileLink(fileId) {
+  const file = await bot.api.getFile({ file_id: fileId });
+  if (!file.file_path) throw new Error('Telegram no devolvió la ruta del audio.');
+  return `https://api.telegram.org/file/bot${process.env.TELEGRAM_BOT_TOKEN}/${file.file_path}`;
+}
 
 // 2. SERVIDOR EXPRESS (Monitoreo y Health-Check local)
 const app = express();
@@ -42,7 +59,7 @@ function usuarioAutorizado(msg) {
 }
 
 async function rechazarAccesoNoAutorizado(chatId) {
-  await bot.sendMessage(chatId, '⛔ Este bot es privado y no tienes acceso autorizado.');
+  await sendMessage(chatId, '⛔ Este bot es privado y no tienes acceso autorizado.');
 }
 
 app.get('/', (req, res) => {
@@ -181,24 +198,21 @@ async function registrarOperacionesEnSupabase(operaciones, rawText) {
 
 // 6. PROCESAMIENTO CENTRAL DE MENSAJES (Texto o Voz)
 async function procesarEntradaFinanciera(chatId, promptParts, rawTextPreview) {
-  await bot.sendChatAction(chatId, 'typing');
+  await sendChatAction(chatId, 'typing');
 
   try {
     const resultado = await analizarConGemini(promptParts);
 
     if (resultado.estado === 'incompleto') {
       // Contador estricto detectó inconsistencia o faltantes
-      await bot.sendMessage(
-        chatId,
-        `⚠️ *Información Incompleta*\n\n${resultado.mensaje_usuario}`,
-        { parse_mode: 'Markdown' }
-      );
+      await sendMessage(chatId, `⚠️ *Información Incompleta*\n\n${resultado.mensaje_usuario}`,
+        { parse_mode: 'Markdown' });
       return;
     }
 
     if (resultado.estado === 'completo') {
       if (!resultado.operaciones || resultado.operaciones.length === 0) {
-        await bot.sendMessage(chatId, '⚠️ No se detectaron operaciones para guardar.');
+        await sendMessage(chatId, '⚠️ No se detectaron operaciones para guardar.');
         return;
       }
 
@@ -220,26 +234,48 @@ async function procesarEntradaFinanciera(chatId, promptParts, rawTextPreview) {
 
       mensajeExito += `_${resultado.mensaje_usuario}_`;
 
-      await bot.sendMessage(chatId, mensajeExito, { parse_mode: 'Markdown' });
+      await sendMessage(chatId, mensajeExito, { parse_mode: 'Markdown' });
     }
   } catch (error) {
     console.error('❌ Error procesando solicitud:', error);
-    await bot.sendMessage(
-      chatId,
-      `❌ *Error Contable/Servidor:* ${error.message}`,
-      { parse_mode: 'Markdown' }
-    );
+    await sendMessage(chatId, `❌ *Error Contable/Servidor:* ${error.message}`,
+      { parse_mode: 'Markdown' });
   }
 }
 
-// 7. LISTENER: MENSAJES DE TEXTO
-bot.on('text', async (msg) => {
+// 7. PROCESAMIENTO DE MENSAJES DE TEXTO
+async function procesarMensajeTexto(msg) {
   const chatId = msg.chat.id;
   if (!usuarioAutorizado(msg)) {
     await rechazarAccesoNoAutorizado(chatId);
     return;
   }
   const texto = msg.text.trim();
+
+  // Vista previa segura para probar Gemini sin crear registros en Supabase.
+  if (texto.startsWith('/previsualizar')) {
+    const match = texto.match(/^\/previsualizar(?:@\w+)?(?:\s+([\s\S]*))?$/i);
+    const entrada = match?.[1]?.trim();
+    if (!entrada) {
+      await sendMessage(chatId, 'Uso: /previsualizar describe aquí el movimiento que quieres analizar.');
+      return;
+    }
+
+    try {
+      await sendChatAction(chatId, 'typing');
+      const resultado = await analizarConGemini([entrada]);
+      const detalle = JSON.stringify(resultado, null, 2) || String(resultado);
+      const limite = 3600;
+      const respuesta = `🧪 Vista previa Gemini — no se guardó en Supabase.\n\n${
+        detalle.length > limite ? `${detalle.slice(0, limite)}\n… (respuesta recortada)` : detalle
+      }`;
+      await sendMessage(chatId, respuesta);
+    } catch (error) {
+      console.error('❌ Error en vista previa Gemini:', error);
+      await sendMessage(chatId, `❌ No se pudo completar la vista previa: ${error.message}`);
+    }
+    return;
+  }
 
   // Comando especial para consultar saldos
   if (texto === '/saldos') {
@@ -251,19 +287,19 @@ bot.on('text', async (msg) => {
       data.forEach((fila) => {
         respuesta += `• *${fila.cuenta}*: ${fila.saldo_actual} ${fila.moneda}\n`;
       });
-      await bot.sendMessage(chatId, respuesta, { parse_mode: 'Markdown' });
+      await sendMessage(chatId, respuesta, { parse_mode: 'Markdown' });
     } catch (err) {
-      await bot.sendMessage(chatId, `❌ Error al consultar saldos: ${err.message}`);
+      await sendMessage(chatId, `❌ Error al consultar saldos: ${err.message}`);
     }
     return;
   }
 
   // Si no es un comando, procesar con Gemini
   await procesarEntradaFinanciera(chatId, [texto], texto);
-});
+}
 
-// 8. LISTENER: NOTAS DE VOZ (Audio nativo multimodal en Gemini)
-bot.on('voice', async (msg) => {
+// 8. PROCESAMIENTO DE NOTAS DE VOZ (Audio nativo multimodal en Gemini)
+async function procesarNotaDeVoz(msg) {
   const chatId = msg.chat.id;
   if (!usuarioAutorizado(msg)) {
     await rechazarAccesoNoAutorizado(chatId);
@@ -271,10 +307,10 @@ bot.on('voice', async (msg) => {
   }
 
   try {
-    await bot.sendChatAction(chatId, 'record_voice');
+    await sendChatAction(chatId, 'record_voice');
 
     // Obtener enlace del audio de Telegram
-    const fileLink = await bot.getFileLink(msg.voice.file_id);
+    const fileLink = await getFileLink(msg.voice.file_id);
     const responseAudio = await axios.get(fileLink, { responseType: 'arraybuffer' });
     const audioBuffer = Buffer.from(responseAudio.data);
 
@@ -293,13 +329,25 @@ bot.on('voice', async (msg) => {
     );
   } catch (err) {
     console.error('❌ Error procesando nota de voz:', err);
-    await bot.sendMessage(chatId, `❌ Error al procesar audio: ${err.message}`);
+    await sendMessage(chatId, `❌ Error al procesar audio: ${err.message}`);
   }
-});
+}
 
 // 9. MANEJO GLOBAL DE ERRORES DEL BOT
-bot.on('polling_error', (error) => {
-  console.error('⚠️ Polling error en Telegram Bot:', error.code || error.message);
+bot.on('message', async (ctx) => {
+  const msg = ctx.message;
+  if (!msg) return;
+  if (typeof msg.text === 'string') return procesarMensajeTexto(msg);
+  if (msg.voice) return procesarNotaDeVoz(msg);
+});
+
+bot.catch((error) => {
+  console.error('⚠️ Error procesando actualización de Telegram:', error.message);
+});
+
+runTelegramBot(bot).catch((error) => {
+  console.error('⚠️ Error de conexión con Telegram:', error.message);
+  process.exitCode = 1;
 });
 
 console.log('🤖 Bot de Telegram inicializado y escuchando...');
