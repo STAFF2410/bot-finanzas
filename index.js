@@ -66,9 +66,12 @@ app.get('/', (req, res) => {
   res.send('🤖 Bot Financiero activo y escuchando eventos.');
 });
 
-app.listen(PORT, () => {
+const healthServer = app.listen(PORT, () => {
   console.log(`🚀 Servidor Express escuchando en http://localhost:${PORT}`);
 });
+for (const signal of ['SIGINT', 'SIGTERM']) {
+  process.once(signal, () => healthServer.close());
+}
 
 // 3. PROMPT DEL SISTEMA PARA GEMINI
 const SYSTEM_PROMPT = `
@@ -122,15 +125,23 @@ ESTRUCTURA JSON OBLIGATORIA:
 }
 `;
 
-// Modelo de Gemini configurado para devolver JSON directamente
-const geminiModel = genAI.getGenerativeModel({
-  model: 'gemini-3.5-flash',
+// Modelos estables: si el principal está saturado, intentar el alternativo.
+const GEMINI_PRIMARY_MODEL = 'gemini-3.8-flash';
+const GEMINI_FALLBACK_MODEL = 'gemini-3.6-flash';
+
+function crearModeloGemini(model) {
+  return genAI.getGenerativeModel({
+  model,
   generationConfig: {
     responseMimeType: 'application/json',
     temperature: 0.1,
   },
   systemInstruction: SYSTEM_PROMPT,
 });
+}
+
+const geminiPrimaryModel = crearModeloGemini(GEMINI_PRIMARY_MODEL);
+const geminiFallbackModel = crearModeloGemini(GEMINI_FALLBACK_MODEL);
 
 // Cache local de cuentas registradas en Supabase
 let cuentasCache = {};
@@ -151,10 +162,44 @@ async function cargarCuentas() {
 cargarCuentas();
 
 // 4. FUNCIÓN PARA PROCESAR EL ANÁLISIS DE GEMINI
+function esErrorTransitorioGemini(error) {
+  const status = Number(error?.status || error?.statusCode || error?.response?.status);
+  return [408, 429, 500, 502, 503, 504].includes(status)
+    || /\b(?:408|429|500|502|503|504)\b|UNAVAILABLE|RESOURCE_EXHAUSTED|overloaded|high demand|service unavailable/i
+      .test(error?.message || '');
+}
+
+async function analizarConModeloGemini(model, modelName, promptParts) {
+  for (let retry = 0; ; retry += 1) {
+    try {
+      const result = await model.generateContent(promptParts);
+      return JSON.parse(result.response.text());
+    } catch (error) {
+      if (!esErrorTransitorioGemini(error) || retry >= 1) throw error;
+      const delayMs = 800 * (2 ** retry);
+      console.warn(`Gemini ${modelName} está ocupado; reintento automático en ${delayMs} ms.`);
+      await new Promise((resolve) => setTimeout(resolve, delayMs));
+    }
+  }
+}
+
 async function analizarConGemini(promptParts) {
-  const result = await geminiModel.generateContent(promptParts);
-  const responseText = result.response.text();
-  return JSON.parse(responseText);
+  try {
+    return await analizarConModeloGemini(
+      geminiPrimaryModel, GEMINI_PRIMARY_MODEL, promptParts
+    );
+  } catch (error) {
+    if (!esErrorTransitorioGemini(error)) throw error;
+    console.warn(`Gemini ${GEMINI_PRIMARY_MODEL} sigue ocupado; probando ${GEMINI_FALLBACK_MODEL}.`);
+    return analizarConModeloGemini(geminiFallbackModel, GEMINI_FALLBACK_MODEL, promptParts);
+  }
+}
+
+function mensajeDeErrorGemini(error) {
+  if (esErrorTransitorioGemini(error)) {
+    return 'Gemini sigue temporalmente saturado después de reintentar. No se guardó ningún movimiento; prueba de nuevo en un momento.';
+  }
+  return error.message;
 }
 
 // 5. REGISTRAR OPERACIONES EN SUPABASE
@@ -238,7 +283,7 @@ async function procesarEntradaFinanciera(chatId, promptParts, rawTextPreview) {
     }
   } catch (error) {
     console.error('❌ Error procesando solicitud:', error);
-    await sendMessage(chatId, `❌ *Error Contable/Servidor:* ${error.message}`,
+    await sendMessage(chatId, `❌ *Error Contable/Servidor:* ${mensajeDeErrorGemini(error)}`,
       { parse_mode: 'Markdown' });
   }
 }
@@ -283,7 +328,7 @@ async function procesarMensajeTexto(msg) {
       await sendMessage(chatId, respuesta);
     } catch (error) {
       console.error('❌ Error en vista previa Gemini:', error);
-      await sendMessage(chatId, `❌ No se pudo completar la vista previa: ${error.message}`);
+      await sendMessage(chatId, `❌ No se pudo completar la vista previa: ${mensajeDeErrorGemini(error)}`);
     }
     return;
   }
